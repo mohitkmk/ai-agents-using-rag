@@ -17,6 +17,7 @@ from src.openai_client import OpenAIClient
 from src.ollama_client import OllamaClient
 from src.vector_store import VectorStoreManager, process_financial_datasets
 from src.agent_tools import get_financial_tools
+from src.guardrails import FinancialGuardrails, FinancialEvaluator
 from config import settings
 
 class FinancialRAGAgent:
@@ -63,6 +64,11 @@ class FinancialRAGAgent:
 
         # Initialize conversation history
         self.conversation_history: List = []
+
+        # Initialize guardrails and evaluator
+        self.guardrails = FinancialGuardrails()
+        self.evaluator = FinancialEvaluator()
+        print("✓ Guardrails and Evaluator initialized")
 
         # Agent executor
         self.agent_executor = None
@@ -111,7 +117,6 @@ class FinancialRAGAgent:
 
                 Remember: This is educational analysis only, not investment advice.
                 """
-
 
             prompt = ChatPromptTemplate.from_messages([
                 ("system", system_prompt),
@@ -197,21 +202,38 @@ class FinancialRAGAgent:
         """Main method to analyze financial queries"""
         print(f"\n🔍 Analyzing: {user_query}")
 
+        # STEP 1: INPUT SAFETY CHECK (Guardrails)
+        is_safe, safety_message = self.guardrails.check_input_safety(user_query)
+        if not is_safe:
+            print(f"⚠️ Security Alert: {safety_message}")
+            return {
+                "query": user_query,
+                "context": "",
+                "response": f"❌ Query blocked: {safety_message}",
+                "sources": [],
+                "method": "guardrails_block",
+                "safety_blocked": True,
+                "safety_reason": safety_message
+            }
+
         analysis_result = {
             "query": user_query,
             "context": "",
             "response": "",
             "sources": [],
-            "method": "hybrid"
+            "method": "hybrid",
+            "safety_blocked": False,
+            "safety_warnings": [],
+            "evaluation": {}
         }
 
-        # Retrieve context
+        # STEP 2: RETRIEVE CONTEXT (RAG)
         if self.enable_rag:
             print("🧠 Retrieving relevant context...")
             context = self.retrieve_relevant_context(user_query)
             analysis_result["context"] = context
 
-        # Enhance query with context
+        # STEP 3: ENHANCE QUERY WITH CONTEXT
         enhanced_query = user_query
         if analysis_result["context"]:
             enhanced_query = f"""
@@ -223,14 +245,26 @@ class FinancialRAGAgent:
             Please analyze this query using the provided context and your financial expertise.
             """
 
-        # Get LLM response
+        # STEP 4: GET LLM RESPONSE
         print("🤖 Generating analysis...")
         response = self.get_llm_response(enhanced_query)
         analysis_result["response"] = response
 
-        # Update conversation history
+        # STEP 5: OUTPUT SAFETY CHECK & COMPLIANCE (Guardrails)
+        is_safe, modified_response, warnings = self.guardrails.check_output_safety(response)
+        analysis_result["response"] = modified_response
+        if warnings:
+            print(f"⚠️ Safety Compliance: {warnings}")
+            analysis_result["safety_warnings"] = warnings.split("; ")
+
+        # STEP 6: EVALUATE RESPONSE QUALITY
+        evaluation = self.evaluator.evaluate_response(user_query, modified_response)
+        analysis_result["evaluation"] = evaluation
+        print(f"📊 Quality Score: {evaluation['overall_score']:.2f}")
+
+        # STEP 7: UPDATE CONVERSATION HISTORY
         self.conversation_history.append(HumanMessage(content=user_query))
-        self.conversation_history.append(AIMessage(content=response))
+        self.conversation_history.append(AIMessage(content=modified_response))
 
         return analysis_result
 
@@ -241,7 +275,9 @@ class FinancialRAGAgent:
             "ollama_available": self.ollama_client is not None,
             "rag_enabled": self.vector_store is not None,
             "tools_enabled": len(self.tools) > 0,
-            "agent_executor_available": self.agent_executor is not None
+            "agent_executor_available": self.agent_executor is not None,
+            "guardrails_enabled": self.guardrails is not None,
+            "evaluator_enabled": self.evaluator is not None
         }
 
 def create_full_agent() -> FinancialRAGAgent:
@@ -271,6 +307,8 @@ def demo_financial_agent():
         result = agent.analyze_query(query)
         print(f"\nQuery: {result['query']}")
         print(f"Response: {result['response'][:200]}...")
+        if result.get('safety_warnings'):
+            print(f"⚠️ Warnings: {result['safety_warnings']}")
 
 if __name__ == "__main__":
     demo_financial_agent()
